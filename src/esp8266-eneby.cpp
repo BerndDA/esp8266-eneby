@@ -9,6 +9,7 @@
 
 #include "Config.h"
 #include "Volume.h"
+#include "Power.h"
 
 #define PIN_PWR D3 // GPIO 16 (has a pulldown res, the others have a pullup)
 #define PIN_LED D0
@@ -38,6 +39,7 @@ PubSubClient mqttClient;
 Config config;
 ConfigManager cfManager;
 Volume vol = Volume(PIN_VOLUP, PIN_VOLDOWN);
+Power pwr = Power(PIN_PWR, PIN_LED); 
 
 WiFiManagerParameter custom_mqtt_server("server", "mqtt server", config.mqtt_server, sizeof(config.mqtt_server));
 WiFiManagerParameter custom_mqtt_user("user", "MQTT username", config.username, sizeof(config.username));
@@ -196,33 +198,6 @@ void publishState(PublishValues *val)
     mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
 }
 
-bool isPowered()
-{
-    return digitalRead(PIN_LED);
-}
-
-void togglePower()
-{
-    pinMode(PIN_PWR, OUTPUT);
-    digitalWrite(PIN_PWR, 0);
-    delay(200);
-    pinMode(PIN_PWR, INPUT);
-}
-
-void powerOn()
-{
-    if (isPowered())
-        return;
-    togglePower();
-}
-
-void powerOff()
-{
-    if (!isPowered())
-        return;
-    togglePower();
-}
-
 void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
 {
     char payloadBuffer[50];
@@ -234,9 +209,9 @@ void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
     Serial.print("MQTT msg: ");
     Serial.println(payloads);
     if (topicStr.endsWith("power") && payloads == "on")
-        powerOn();
+        pwr.on();
     else if (topicStr.endsWith("power") && payloads == "off")
-        powerOff();
+        pwr.off();
     else if (topicStr.endsWith("volume") && payloads.startsWith("up"))
         vol.volUp();
     else if (topicStr.endsWith("volume") && payloads.startsWith("down"))
@@ -245,7 +220,7 @@ void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
     {
         uint8_t newVol = payloads.toInt();
         if (newVol == 0)
-            powerOff();
+            pwr.off();
         else
             vol.setVolume(newVol);
     }
@@ -346,7 +321,7 @@ void loop()
     const uint32_t currentMillis = millis();
     if (currentMillis - statusPublishPreviousMillis >= statusPublishInterval)
     {
-        newValues.powered = isPowered();
+        newValues.powered = pwr.isPowered();
         newValues.volume = vol.getVolume();
         statusPublishPreviousMillis = currentMillis;
         printf("Publish state\n");
@@ -357,7 +332,7 @@ void loop()
     if (currentMillis - pwrCheckPreviousMillis >= pwrCheckInterval)
     {
         pwrCheckPreviousMillis = currentMillis;
-        newValues.powered = isPowered();
+        newValues.powered = pwr.isPowered();
         newValues.volume = vol.getVolume();
         if (pubVal.powered != newValues.powered)
         {
