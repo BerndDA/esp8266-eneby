@@ -8,22 +8,40 @@
 #include <WiFiManager.h>
 
 #include "Config.h"
+#include "Volume.h"
 
 #define PIN_PWR D3 // GPIO 16 (has a pulldown res, the others have a pullup)
 #define PIN_LED D0
 #define PIN_VOLUP D7   // VOL+
 #define PIN_VOLDOWN D6 // VOL-
 
+struct PublishValues
+{
+    bool powered;
+    uint8_t volume;
+};
+bool operator==(const PublishValues &lhs, const PublishValues &rhs)
+{
+    return lhs.powered == rhs.powered && lhs.volume == rhs.volume;
+};
+bool operator!=(const PublishValues &lhs, const PublishValues &rhs)
+{
+    return !(lhs == rhs);
+};
+
 uint8_t mqttRetryCounter = 0;
-bool powered = false;
+PublishValues pubVal;
 
 WiFiManager wifiManager;
 WiFiClient wifiClient;
 PubSubClient mqttClient;
+Config config;
+ConfigManager cfManager;
+Volume vol = Volume(PIN_VOLUP, PIN_VOLDOWN);
 
-WiFiManagerParameter custom_mqtt_server("server", "mqtt server", Config::mqtt_server, sizeof(Config::mqtt_server));
-WiFiManagerParameter custom_mqtt_user("user", "MQTT username", Config::username, sizeof(Config::username));
-WiFiManagerParameter custom_mqtt_pass("pass", "MQTT password", Config::password, sizeof(Config::password));
+WiFiManagerParameter custom_mqtt_server("server", "mqtt server", config.mqtt_server, sizeof(config.mqtt_server));
+WiFiManagerParameter custom_mqtt_user("user", "MQTT username", config.username, sizeof(config.username));
+WiFiManagerParameter custom_mqtt_pass("pass", "MQTT password", config.password, sizeof(config.password));
 
 uint32_t lastMqttConnectionAttempt = 0;
 const uint16_t mqttConnectionInterval = 60000; // 1 minute = 60 seconds = 60000 milliseconds
@@ -48,27 +66,9 @@ char MQTT_TOPIC_AUTOCONF_PM25_SENSOR[128];
 
 bool shouldSaveConfig = false;
 
-uint16_t currentVol = 100;
-bool publishVol = false;
-uint8_t volPattern = 0;
-char patterns[] = {0b00, 0b01, 0b11, 0b10};
-uint8_t patternIdx = 0;
-
 void saveConfigCallback()
 {
     shouldSaveConfig = true;
-}
-
-uint8_t getEncoderIdx()
-{
-    pinMode(PIN_VOLUP, INPUT);
-    pinMode(PIN_VOLDOWN, INPUT);
-    bool vol1 = digitalRead(PIN_VOLUP);
-    bool vol2 = digitalRead(PIN_VOLDOWN);
-    uint8_t p = vol1 + vol2 * 2;
-    if (p == patterns[0])
-        return 0;
-    return 2;
 }
 
 void setupWifi()
@@ -85,20 +85,20 @@ void setupWifi()
     //wifiManager.startConfigPortal(identifier);
     mqttClient.setClient(wifiClient);
 
-    strcpy(Config::mqtt_server, custom_mqtt_server.getValue());
-    strcpy(Config::username, custom_mqtt_user.getValue());
-    strcpy(Config::password, custom_mqtt_pass.getValue());
+    strcpy(config.mqtt_server, custom_mqtt_server.getValue());
+    strcpy(config.username, custom_mqtt_user.getValue());
+    strcpy(config.password, custom_mqtt_pass.getValue());
 
     if (shouldSaveConfig)
     {
-        Config::save();
+        cfManager.save(&config);
     }
     else
     {
         // For some reason, the read values get overwritten in this function
         // To combat this, we just reload the config
         // This is most likely a logic error which could be fixed otherwise
-        Config::load();
+        cfManager.load(&config);
     }
 }
 
@@ -121,7 +121,7 @@ void publishAutoConfig()
 
     device["identifiers"] = identifiers;
     device["manufacturer"] = "Ikea";
-    device["model"] = "VINDRIKTNING";
+    device["model"] = "ENEBY";
     device["name"] = identifier;
     device["sw_version"] = "2021.08.0";
 
@@ -144,11 +144,11 @@ void publishAutoConfig()
     autoconfPayload["device"] = device.as<JsonObject>();
     autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
     autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
-    autoconfPayload["name"] = identifier + String(" PM 2.5");
-    autoconfPayload["unit_of_measurement"] = "μg/m³";
+    autoconfPayload["name"] = identifier + String(" Control");
+    autoconfPayload["unit_of_measurement"] = "%";
     autoconfPayload["value_template"] = "{{value_json.power}}";
-    autoconfPayload["unique_id"] = identifier + String("_pm25");
-    autoconfPayload["icon"] = "mdi:air-filter";
+    autoconfPayload["unique_id"] = identifier + String("_control");
+    autoconfPayload["icon"] = "mdi:control";
 
     serializeJson(autoconfPayload, mqttPayload);
     mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PM25_SENSOR[0], &mqttPayload[0], true);
@@ -160,7 +160,7 @@ void mqttReconnect()
 {
     for (uint8_t attempt = 0; attempt < 3; ++attempt)
     {
-        if (mqttClient.connect(identifier, Config::username, Config::password, MQTT_TOPIC_AVAILABILITY, 1, true, AVAILABILITY_OFFLINE))
+        if (mqttClient.connect(identifier, config.username, config.password, MQTT_TOPIC_AVAILABILITY, 1, true, AVAILABILITY_OFFLINE))
         {
             mqttClient.publish(MQTT_TOPIC_AVAILABILITY, AVAILABILITY_ONLINE, true);
             publishAutoConfig();
@@ -178,7 +178,7 @@ bool isMqttConnected()
     return mqttClient.connected();
 }
 
-void publishState()
+void publishState(PublishValues *val)
 {
     DynamicJsonDocument wifiJson(192);
     DynamicJsonDocument stateJson(604);
@@ -188,18 +188,16 @@ void publishState()
     wifiJson["ip"] = WiFi.localIP().toString();
     wifiJson["rssi"] = WiFi.RSSI();
 
-    stateJson["power"] = powered ? "on" : "off";
-    stateJson["vol"] = currentVol;
-    stateJson["pattern"] = String(volPattern, BIN);
+    stateJson["power"] = val->powered ? "on" : "off";
+    stateJson["volume"] = val->volume;
     stateJson["wifi"] = wifiJson.as<JsonObject>();
-
+    stateJson["heap"] = ESP.getFreeHeap();
     serializeJson(stateJson, payload);
     mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
 }
 
 bool isPowered()
 {
-
     return digitalRead(PIN_LED);
 }
 
@@ -208,8 +206,6 @@ void togglePower()
     pinMode(PIN_PWR, OUTPUT);
     digitalWrite(PIN_PWR, 0);
     delay(200);
-    //digitalWrite(PIN_PWR,255);
-    //delay(200);
     pinMode(PIN_PWR, INPUT);
 }
 
@@ -227,34 +223,6 @@ void powerOff()
     togglePower();
 }
 
-void stepVolume(bool reverse)
-{
-    digitalWrite(reverse ? PIN_VOLDOWN : PIN_VOLUP, HIGH);
-    delay(20);
-    digitalWrite(reverse ? PIN_VOLUP : PIN_VOLDOWN, HIGH);
-    delay(20);
-    digitalWrite(reverse ? PIN_VOLDOWN : PIN_VOLUP, LOW);
-    delay(20);
-    digitalWrite(reverse ? PIN_VOLUP : PIN_VOLDOWN, LOW);
-    delay(20);
-}
-
-void setVolume(uint16_t absolute)
-{
-
-    long diff = absolute - currentVol;
-    if (diff != 0)
-    {
-        pinMode(PIN_VOLUP, OUTPUT);
-        pinMode(PIN_VOLDOWN, OUTPUT);
-        for (uint16_t i = 0; i < abs(diff); i++)
-            stepVolume(diff < 0);
-        pinMode(PIN_VOLUP, INPUT);
-        pinMode(PIN_VOLDOWN, INPUT);
-        currentVol = absolute;
-    }
-}
-
 void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
 {
     char payloadBuffer[50];
@@ -262,20 +230,25 @@ void mqttCallback(char *topic, uint8_t *payload, unsigned int length)
     strncpy(&payloadBuffer[0], (char *)payload, length);
     payloadBuffer[length] = '\0';
     String payloads = String((char *)payloadBuffer);
+    String topicStr = String(topic);
     Serial.print("MQTT msg: ");
     Serial.println(payloads);
-    if (payloads == "on")
+    if (topicStr.endsWith("power") && payloads == "on")
         powerOn();
-    else if (payloads == "off")
+    else if (topicStr.endsWith("power") && payloads == "off")
         powerOff();
-    else if (payloads.startsWith("vol"))
+    else if (topicStr.endsWith("volume") && payloads.startsWith("up"))
+        vol.volUp();
+    else if (topicStr.endsWith("volume") && payloads.startsWith("down"))
+        vol.volDown();
+    else if (topicStr.endsWith("volume"))
     {
-        uint16_t vol = payloads.substring(3).toInt();
-        setVolume(vol);
-        publishVol = true;
+        uint8_t newVol = payloads.toInt();
+        if (newVol == 0)
+            powerOff();
+        else
+            vol.setVolume(newVol);
     }
-    else if (payloads == "reset")
-        resetWifiSettingsAndReboot();
 }
 
 void setupOTA()
@@ -334,18 +307,18 @@ void setup()
     snprintf(identifier, sizeof(identifier), "ENEBY-%X", ESP.getChipId());
     snprintf(MQTT_TOPIC_AVAILABILITY, 127, "%s/%s/status", FIRMWARE_PREFIX, identifier);
     snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/state", FIRMWARE_PREFIX, identifier);
-    snprintf(MQTT_TOPIC_COMMAND, 127, "%s/%s/command", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_COMMAND, 127, "%s/%s/command/#", FIRMWARE_PREFIX, identifier);
 
-    snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, 127, "homeassistant/sensor/%s/%s_pm25/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, 127, "homeassistant/sensor/%s/%s_device/config", FIRMWARE_PREFIX, identifier);
     snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, 127, "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX, identifier);
 
     WiFi.hostname(identifier);
 
-    Config::load();
+    cfManager.load(&config);
 
     setupWifi();
     setupOTA();
-    mqttClient.setServer(Config::mqtt_server, 1883);
+    mqttClient.setServer(config.mqtt_server, 1883);
     mqttClient.setKeepAlive(10);
     mqttClient.setBufferSize(2048);
     mqttClient.setCallback(mqttCallback);
@@ -354,7 +327,6 @@ void setup()
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
 
     pinMode(PIN_LED, INPUT_PULLDOWN_16);
-    patternIdx = getEncoderIdx();
 
     Serial.println("-- Current GPIO Configuration --");
     Serial.printf("PIN_LED: %d\n", PIN_LED);
@@ -368,33 +340,38 @@ void setup()
 void loop()
 {
     ArduinoOTA.handle();
-    //SerialCom::handleUart(state);
     mqttClient.loop();
+    PublishValues newValues;
 
     const uint32_t currentMillis = millis();
     if (currentMillis - statusPublishPreviousMillis >= statusPublishInterval)
     {
+        newValues.powered = isPowered();
+        newValues.volume = vol.getVolume();
         statusPublishPreviousMillis = currentMillis;
         printf("Publish state\n");
-        publishState();
+        publishState(&newValues);
+        pubVal = newValues;
     }
 
     if (currentMillis - pwrCheckPreviousMillis >= pwrCheckInterval)
     {
         pwrCheckPreviousMillis = currentMillis;
-        bool pwr = isPowered();
-        if (pwr != powered)
+        newValues.powered = isPowered();
+        newValues.volume = vol.getVolume();
+        if (pubVal.powered != newValues.powered)
         {
-            powered = pwr;
-            currentVol = 0;
-            publishState();
-            Serial.printf("POWER: %d\n", isPowered());
+            if (!newValues.powered)
+                vol.disable();
+            else
+                vol.reset();
+            newValues.volume = vol.getVolume();
         }
-        else if (publishVol)
+        if (newValues != pubVal)
         {
-            publishState();
+            pubVal = newValues;
+            publishState(&pubVal);
         }
-        publishVol = false;
     }
 
     if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval)
@@ -402,14 +379,5 @@ void loop()
         lastMqttConnectionAttempt = currentMillis;
         printf("Reconnect mqtt\n");
         mqttReconnect();
-    }
-
-    bool vol1 = digitalRead(PIN_VOLUP);
-    bool vol2 = digitalRead(PIN_VOLDOWN);
-    uint8_t p = vol1 + vol2 * 2;
-    if (p != volPattern)
-    {
-        volPattern = p;
-        publishState();
     }
 }
