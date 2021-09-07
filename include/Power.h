@@ -9,6 +9,7 @@ private:
 
 public:
     Power(uint8_t pinPwr, uint8_t pinLed);
+    void setup();
     void on();
     void off();
     void toggle();

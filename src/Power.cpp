@@ -6,6 +6,11 @@ Power::Power(uint8_t pinPwr, uint8_t pinLed)
     _pinLed = pinLed;
 }
 
+void Power::setup()
+{
+    pinMode(_pinLed, INPUT_PULLDOWN_16);
+}
+
 void Power::toggle()
 {
     pinMode(_pinPwr, OUTPUT);

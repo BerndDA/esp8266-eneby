@@ -293,6 +293,7 @@ void setup()
 
     setupWifi();
     setupOTA();
+    pwr.setup();
     mqttClient.setServer(config.mqtt_server, 1883);
     mqttClient.setKeepAlive(10);
     mqttClient.setBufferSize(2048);
@@ -301,7 +302,7 @@ void setup()
     Serial.printf("Hostname: %s\n", identifier);
     Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
 
-    pinMode(PIN_LED, INPUT_PULLDOWN_16);
+    
 
     Serial.println("-- Current GPIO Configuration --");
     Serial.printf("PIN_LED: %d\n", PIN_LED);
